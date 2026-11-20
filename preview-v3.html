@@ -91,7 +91,41 @@ const supabaseClient=window.supabase.createClient(SUPABASE_URL,SUPABASE_PUBLISHA
 let currentUser=null,storagePrefix="mdo3preview_guest_";
 const $=id=>document.getElementById(id),today=()=>{let d=new Date();return key(d)},key=d=>[d.getFullYear(),String(d.getMonth()+1).padStart(2,'0'),String(d.getDate()).padStart(2,'0')].join('-'),parse=s=>new Date(s+'T12:00:00'),load=(k,def)=>{try{return JSON.parse(localStorage.getItem(storagePrefix+k))??def}catch{return def}},save=()=>{localStorage.setItem(storagePrefix+'tasks',JSON.stringify(tasks));localStorage.setItem(storagePrefix+'habits',JSON.stringify(habits));localStorage.setItem(storagePrefix+'checks',JSON.stringify(checks));localStorage.setItem(storagePrefix+'goals',JSON.stringify(goals));queueCloudSave()};
 let tasks=[],habits=['Beber água','Fazer atividade física','Ler ou estudar','Organizar o ambiente'],checks={},goals=[],filter='all',selectedWeek=today(),reminderTimers=[];
-async function loadAccountData(){storagePrefix='mdo3preview_user_'+currentUser.id+'_';const hasAccountData=['tasks','habits','checks','goals'].some(k=>localStorage.getItem(storagePrefix+k)!==null);if(!hasAccountData&&!localStorage.getItem('mdo3preview_account_migration_done')){['tasks','habits','checks','goals'].forEach(k=>{let old=localStorage.getItem('mdo3preview_'+k);if(old===null)old=localStorage.getItem('mdo_'+k);if(old!==null)localStorage.setItem(storagePrefix+k,old)});localStorage.setItem('mdo3preview_account_migration_done','1')}tasks=load('tasks',[]);habits=load('habits',['Beber água','Fazer atividade física','Ler ou estudar','Organizar o ambiente']);checks=load('checks',{});goals=load('goals',[]);filter='all';selectedWeek=today();render();setSyncLabel('Conectando à nuvem...');const uid=currentUser.id;try{const {data,error}=await supabaseClient.from('user_data').select('data,updated_at').eq('user_id',uid).maybeSingle();if(error)throw error;if(currentUser?.id!==uid)return;if(data&&data.data&&Object.keys(data.data).length){tasks=Array.isArray(data.data.tasks)?data.data.tasks:[];habits=Array.isArray(data.data.habits)?data.data.habits:habits;checks=data.data.checks&&typeof data.data.checks==='object'?data.data.checks:{};goals=Array.isArray(data.data.goals)?data.data.goals:[];saveLocalOnly();render();setSyncLabel('Sincronizado com a nuvem')}else{await writeCloudSnapshot(uid);setSyncLabel('Dados enviados para a nuvem')}}catch(err){console.error('Falha na sincronização inicial:',err);setSyncLabel('Offline: dados mantidos neste aparelho')}}
+async function loadAccountData(){
+ storagePrefix='mdo3preview_user_'+currentUser.id+'_';
+ const uid=currentUser.id;
+ const hasAccountData=['tasks','habits','checks','goals'].some(k=>localStorage.getItem(storagePrefix+k)!==null);
+ if(!hasAccountData&&!localStorage.getItem('mdo3preview_account_migration_done')){
+  ['tasks','habits','checks','goals'].forEach(k=>{let old=localStorage.getItem('mdo3preview_'+k);if(old===null)old=localStorage.getItem('mdo_'+k);if(old!==null)localStorage.setItem(storagePrefix+k,old)});
+  localStorage.setItem('mdo3preview_account_migration_done','1');
+ }
+ tasks=load('tasks',[]);habits=load('habits',['Beber água','Fazer atividade física','Ler ou estudar','Organizar o ambiente']);checks=load('checks',{});goals=load('goals',[]);
+ filter='all';selectedWeek=today();render();setSyncLabel('Conectando à nuvem...');
+ try{
+  const {data,error}=await supabaseClient.from('user_data').select('data,updated_at').eq('user_id',uid).maybeSingle();
+  if(error)throw error;
+  if(currentUser?.id!==uid)return;
+  if(data&&data.data&&Object.keys(data.data).length){
+   const cloudTasks=Array.isArray(data.data.tasks)?data.data.tasks:[];
+   const localTasks=Array.isArray(tasks)?tasks:[];
+   const byId=new Map();
+   cloudTasks.forEach(t=>{if(t&&t.id!=null)byId.set(String(t.id),t)});
+   localTasks.forEach(t=>{if(t&&t.id!=null&&!byId.has(String(t.id)))byId.set(String(t.id),t)});
+   const mergedTasks=Array.from(byId.values());
+   const localHadExtra=mergedTasks.length!==cloudTasks.length;
+   tasks=mergedTasks;
+   habits=Array.isArray(data.data.habits)?data.data.habits:habits;
+   checks=data.data.checks&&typeof data.data.checks==='object'?data.data.checks:checks;
+   goals=Array.isArray(data.data.goals)?data.data.goals:goals;
+   saveLocalOnly();render();
+   if(localHadExtra){await writeCloudSnapshot(uid);setSyncLabel('Tarefas recuperadas e sincronizadas')}
+   else setSyncLabel('Sincronizado com a nuvem');
+  }else{
+   await writeCloudSnapshot(uid);
+   setSyncLabel('Dados enviados para a nuvem');
+  }
+ }catch(err){console.error('Falha na sincronização inicial:',err);setSyncLabel('Falha na nuvem: dados locais preservados')}
+}
 
 let dl=new Intl.DateTimeFormat('pt-BR',{weekday:'long',day:'numeric',month:'long',year:'numeric'}).format(new Date());$('todayDate').textContent=dl[0].toUpperCase()+dl.slice(1);$('taskDate').value=today();
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function fmt(s){return parse(s).toLocaleDateString('pt-BR')}function toast(s){$('toast').textContent=s;$('toast').classList.add('show');setTimeout(()=>$('toast').classList.remove('show'),2000)}
