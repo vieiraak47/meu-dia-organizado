@@ -175,9 +175,9 @@ function setAuthMode(mode){authMode=mode;const signup=mode==='signup',recover=mo
 $('modeLogin').onclick=()=>setAuthMode('login');$('modeSignup').onclick=()=>setAuthMode('signup');$('modeRecover').onclick=()=>setAuthMode('recover');
 $('authForm').onsubmit=async e=>{e.preventDefault();const email=$('authEmail').value.trim(),password=$('authPassword').value,name=$('authName').value.trim();$('authSubmit').disabled=true;$('authSubmit').textContent='Aguarde...';$('authMessage').textContent='';try{if(authMode==='signup'){if(!name)throw Error('Informe seu nome.');const {data,error}=await supabaseClient.auth.signUp({email,password,options:{data:{name},emailRedirectTo:location.href}});if(error)throw error;$('authMessage').textContent=data.session?'Conta criada! Entrando...':'Cadastro iniciado! Confira seu e-mail e confirme o cadastro antes de entrar.'}else if(authMode==='recover'){const {error}=await supabaseClient.auth.resetPasswordForEmail(email,{redirectTo:location.href});if(error)throw error;$('authMessage').textContent='Se o endereço estiver cadastrado, você receberá um e-mail com as instruções.'}else{const {error}=await supabaseClient.auth.signInWithPassword({email,password});if(error)throw error}}catch(err){$('authMessage').textContent=err.message||'Não foi possível concluir. Tente novamente.'}finally{$('authSubmit').disabled=false;$('authSubmit').textContent=authMode==='signup'?'Criar minha conta':authMode==='recover'?'Enviar link de recuperação':'Entrar'}};
 window.mdoLogout=()=>{const btn=$('logoutBtn');if(btn.disabled)return;btn.disabled=true;btn.textContent='Saindo...';showSignedOut();$('authMessage').textContent='Encerrando sua sessão...';supabaseClient.auth.signOut({scope:'local'}).then(({error})=>{if(error)throw error;$('authMessage').textContent='Você saiu da sua conta.'}).catch(err=>{console.error('Erro ao sair:',err);$('authMessage').textContent='A sessão local foi encerrada nesta tela. Se a conta voltar, atualize a página e tente novamente.'}).finally(()=>{btn.disabled=false;btn.textContent='Sair da conta'})};
-async function activateAccount(session){if(currentUser?.id===session.user.id&&window.accountLoaded)return;currentUser=session.user;window.accountLoaded=true;$('authGate').style.display='none';$('appRoot').style.display='block';document.querySelector('.tabs').style.display='flex';await loadAccountData();if(currentUser?.id!==session.user.id)return;startRealtimeSync(session.user.id);try{const {data}=await supabaseClient.from('profiles').select('id').eq('id',currentUser.id).maybeSingle();if(!data){const {error}=await supabaseClient.from('profiles').insert({id:currentUser.id,name:currentUser.user_metadata?.name||''});if(error)console.warn('Perfil não criado:',error.message)}}catch(err){console.warn('Perfil:',err.message)}}
+async function activateAccount(session){if(currentUser?.id===session.user.id&&window.accountLoaded)return;currentUser=session.user;window.accountLoaded=true;$('authGate').style.display='none';$('appRoot').style.display='block';document.querySelector('.tabs').style.display='flex';await loadAccountData();if(currentUser?.id!==session.user.id)return;startRealtimeSync(session.user.id);startTaskPolling(session.user.id);try{const {data}=await supabaseClient.from('profiles').select('id').eq('id',currentUser.id).maybeSingle();if(!data){const {error}=await supabaseClient.from('profiles').insert({id:currentUser.id,name:currentUser.user_metadata?.name||''});if(error)console.warn('Perfil não criado:',error.message)}}catch(err){console.warn('Perfil:',err.message)}}
 let cloudSaveTimer=null,cloudBusy=false,cloudPending=false,realtimeChannel=null,cloudRefreshBusy=false,cloudRefreshPending=false,lastCloudUpdatedAt=null;
-let taskBaseline=new Map(),pendingTaskIds=new Set(),taskTombstones={};
+let taskBaseline=new Map(),pendingTaskIds=new Set(),taskTombstones={},taskRefreshBusy=false,taskRefreshPending=false;
 function setSyncLabel(message){const el=$('syncStatus');if(el)el.textContent=message}
 function taskSignature(task){const copy={...task};delete copy._syncUpdatedAt;return JSON.stringify(copy)}
 function trackTaskChanges(){
@@ -214,30 +214,43 @@ async function flushTaskChanges(uid){
 }
 async function refreshTaskRows(uid){
  if(!currentUser||currentUser.id!==uid)return;
- const {data,error}=await supabaseClient.from('user_tasks').select('task_id,task,deleted,updated_at').eq('user_id',uid);
- if(error)throw error;
- if(currentUser?.id!==uid)return;
- const localMap=new Map(tasks.filter(t=>t&&t.id!=null).map(t=>[String(t.id),t]));
- const remoteIds=new Set();
- for(const row of data||[]){
-  const id=String(row.task_id);remoteIds.add(id);
-  const local=localMap.get(id),remoteStamp=Date.parse(row.updated_at||0),localStamp=Date.parse(local?._syncUpdatedAt||0),localDeleteStamp=Date.parse(taskTombstones[id]||0);
-  if(taskTombstones[id]&&localDeleteStamp>=remoteStamp&&!row.deleted){pendingTaskIds.add(id);continue}
-  if(row.deleted){
-   if(!local||remoteStamp>=localStamp){localMap.delete(id);taskTombstones[id]=row.updated_at||new Date().toISOString()}
-  }else if(!local||remoteStamp>localStamp){
-   localMap.set(id,{...row.task,_syncUpdatedAt:row.updated_at||new Date().toISOString()});delete taskTombstones[id];
-  }else if(local&&remoteStamp<localStamp){pendingTaskIds.add(id)}
- }
- tasks=Array.from(localMap.values());
- for(const [id] of localMap)if(!remoteIds.has(id))pendingTaskIds.add(id);
- Object.keys(taskTombstones).forEach(id=>{if(!remoteIds.has(id))pendingTaskIds.add(id)});
- taskBaseline=new Map(tasks.map(t=>[String(t.id),taskSignature(t)]));
- saveLocalOnly();render();
- if(pendingTaskIds.size)queueCloudSave();
+ if(taskRefreshBusy){taskRefreshPending=true;return}
+ if(cloudBusy||cloudSaveTimer){taskRefreshPending=true;return}
+ taskRefreshBusy=true;
+ try{
+  const {data,error}=await supabaseClient.from('user_tasks').select('task_id,task,deleted,updated_at').eq('user_id',uid);
+  if(error)throw error;
+  if(currentUser?.id!==uid)return;
+  const localMap=new Map(tasks.filter(t=>t&&t.id!=null).map(t=>[String(t.id),t]));
+  const remoteIds=new Set();let changed=false;
+  for(const row of data||[]){
+   const id=String(row.task_id);remoteIds.add(id);
+   const local=localMap.get(id),remoteStamp=Date.parse(row.updated_at||0),localStamp=Date.parse(local?._syncUpdatedAt||0),localDeleteStamp=Date.parse(taskTombstones[id]||0);
+   if(taskTombstones[id]&&localDeleteStamp>=remoteStamp&&!row.deleted){pendingTaskIds.add(id);continue}
+   if(row.deleted){
+    if(!local||remoteStamp>=localStamp){if(local){localMap.delete(id);changed=true}taskTombstones[id]=row.updated_at||new Date().toISOString()}
+   }else if(!local||remoteStamp>localStamp){
+    localMap.set(id,{...row.task,_syncUpdatedAt:row.updated_at||new Date().toISOString()});delete taskTombstones[id];changed=true;
+   }else if(local&&remoteStamp<localStamp){pendingTaskIds.add(id)}
+  }
+  tasks=Array.from(localMap.values());
+  for(const [id] of localMap)if(!remoteIds.has(id))pendingTaskIds.add(id);
+  Object.keys(taskTombstones).forEach(id=>{if(!remoteIds.has(id))pendingTaskIds.add(id)});
+  taskBaseline=new Map(tasks.map(t=>[String(t.id),taskSignature(t)]));saveLocalOnly();
+  if(changed){render();setSyncLabel('Tarefas recebidas da nuvem')}else setSyncLabel('Sincronizado com a nuvem');
+  if(pendingTaskIds.size)queueCloudSave();
+ }finally{taskRefreshBusy=false;if(taskRefreshPending){taskRefreshPending=false;setTimeout(()=>refreshTaskRows(uid),300)}}
 }
+
 function applyCloudData(data){if(!data||typeof data!=='object')return;habits=Array.isArray(data.habits)?data.habits:habits;checks=data.checks&&typeof data.checks==='object'?data.checks:checks;goals=Array.isArray(data.goals)?data.goals:goals;localStorage.setItem(storagePrefix+'habits',JSON.stringify(habits));localStorage.setItem(storagePrefix+'checks',JSON.stringify(checks));localStorage.setItem(storagePrefix+'goals',JSON.stringify(goals));render()}
 async function refreshCloudSnapshot(uid){if(!currentUser||currentUser.id!==uid)return;if(cloudRefreshBusy){cloudRefreshPending=true;return}if(cloudBusy||cloudSaveTimer){cloudRefreshPending=true;return}cloudRefreshBusy=true;try{const {data,error}=await supabaseClient.from('user_data').select('data,updated_at').eq('user_id',uid).maybeSingle();if(error)throw error;if(currentUser?.id!==uid)return;if(data?.data&&data.updated_at&&data.updated_at!==lastCloudUpdatedAt){applyCloudData(data.data);lastCloudUpdatedAt=data.updated_at;setSyncLabel('Dados atualizados de outro aparelho')}}catch(err){console.error('Falha ao receber atualização:',err);setSyncLabel('Não foi possível atualizar agora')}finally{cloudRefreshBusy=false;if(cloudRefreshPending){cloudRefreshPending=false;setTimeout(()=>refreshCloudSnapshot(uid),250)}}}
+function startTaskPolling(uid){
+ if(window.mdoTaskPoll)clearInterval(window.mdoTaskPoll);
+ const pull=()=>{if(document.visibilityState==='visible'&&currentUser?.id===uid&&!cloudBusy&&!cloudSaveTimer)refreshTaskRows(uid).catch(err=>{console.error('Falha na verificação periódica:',err);setSyncLabel('Não foi possível atualizar tarefas agora')})};
+ window.mdoTaskPoll=setInterval(pull,5000);
+ document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')pull()});
+ window.addEventListener('focus',pull);pull();
+}
 function startRealtimeSync(uid){
  if(realtimeChannel)supabaseClient.removeChannel(realtimeChannel);
  realtimeChannel=supabaseClient.channel('mdo-user-sync-'+uid)
@@ -254,7 +267,7 @@ function queueCloudSave(){
   finally{cloudBusy=false;if(cloudPending){cloudPending=false;queueCloudSave()}else if(cloudRefreshPending){cloudRefreshPending=false;setTimeout(()=>refreshCloudSnapshot(uid),250)}}
  },700)
 }
-function showSignedOut(){window.accountLoaded=false;currentUser=null;clearTimeout(cloudSaveTimer);cloudSaveTimer=null;if(realtimeChannel){supabaseClient.removeChannel(realtimeChannel);realtimeChannel=null}lastCloudUpdatedAt=null;taskBaseline=new Map();pendingTaskIds=new Set();taskTombstones={};$('appRoot').style.display='none';document.querySelector('.tabs').style.display='none';$('authGate').style.display='grid';setAuthMode('login')}
+function showSignedOut(){window.accountLoaded=false;currentUser=null;clearTimeout(cloudSaveTimer);cloudSaveTimer=null;if(realtimeChannel){supabaseClient.removeChannel(realtimeChannel);realtimeChannel=null}if(window.mdoTaskPoll){clearInterval(window.mdoTaskPoll);window.mdoTaskPoll=null}lastCloudUpdatedAt=null;taskBaseline=new Map();pendingTaskIds=new Set();taskTombstones={};$('appRoot').style.display='none';document.querySelector('.tabs').style.display='none';$('authGate').style.display='grid';setAuthMode('login')}
 supabaseClient.auth.onAuthStateChange((event,session)=>{if(session){setTimeout(()=>activateAccount(session),0)}else if(event==='SIGNED_OUT'||event==='INITIAL_SESSION')showSignedOut()});
 (async()=>{const {data,error}=await supabaseClient.auth.getSession();if(error){$('authMessage').textContent='Não foi possível verificar a sessão. Atualize a página.';return}if(data.session)await activateAccount(data.session);else showSignedOut()})();
 
