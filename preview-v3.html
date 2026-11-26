@@ -221,6 +221,7 @@ async function refreshTaskRows(uid){
   const {data,error}=await supabaseClient.from('user_tasks').select('task_id,task,deleted,updated_at').eq('user_id',uid);
   if(error)throw error;
   if(currentUser?.id!==uid)return;
+  console.info('[MDO sync] Consulta user_tasks:',{uid,registros:(data||[]).length,testeV8:(data||[]).some(r=>r.task?.name==='Teste v8')});
   const localMap=new Map(tasks.filter(t=>t&&t.id!=null).map(t=>[String(t.id),t]));
   const remoteIds=new Set();let changed=false;
   for(const row of data||[]){
@@ -237,7 +238,7 @@ async function refreshTaskRows(uid){
   for(const [id] of localMap)if(!remoteIds.has(id))pendingTaskIds.add(id);
   Object.keys(taskTombstones).forEach(id=>{if(!remoteIds.has(id))pendingTaskIds.add(id)});
   taskBaseline=new Map(tasks.map(t=>[String(t.id),taskSignature(t)]));saveLocalOnly();
-  if(changed){render();setSyncLabel('Tarefas recebidas da nuvem')}else setSyncLabel('Sincronizado com a nuvem');
+  if(changed){render();setSyncLabel('Recebidas '+(data||[]).filter(r=>!r.deleted).length+' tarefas da nuvem')}else setSyncLabel('Consulta concluída: '+(data||[]).filter(r=>!r.deleted).length+' tarefas na nuvem');
   if(pendingTaskIds.size)queueCloudSave();
  }finally{taskRefreshBusy=false;if(taskRefreshPending){taskRefreshPending=false;setTimeout(()=>refreshTaskRows(uid),300)}}
 }
@@ -255,7 +256,7 @@ function startRealtimeSync(uid){
  if(realtimeChannel)supabaseClient.removeChannel(realtimeChannel);
  realtimeChannel=supabaseClient.channel('mdo-user-sync-'+uid)
  .on('postgres_changes',{event:'*',schema:'public',table:'user_data',filter:'user_id=eq.'+uid},payload=>{if(payload.new?.updated_at&&payload.new.updated_at===lastCloudUpdatedAt)return;refreshCloudSnapshot(uid)})
- .on('postgres_changes',{event:'*',schema:'public',table:'user_tasks',filter:'user_id=eq.'+uid},()=>{refreshTaskRows(uid).catch(err=>{console.error('Falha ao receber tarefas:',err);setSyncLabel('Erro ao atualizar tarefas; dados locais preservados')})})
+ .on('postgres_changes',{event:'*',schema:'public',table:'user_tasks',filter:'user_id=eq.'+uid},()=>{refreshTaskRows(uid).catch(err=>{console.error('Falha ao receber tarefas:',err);setSyncLabel('ERRO na consulta: '+(err.message||'verifique a conexão'))})})
  .subscribe(status=>{if(status==='SUBSCRIBED')setSyncLabel('Conectado: sincronização ativa');else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT')setSyncLabel('Atualização em tempo real indisponível; dados locais preservados')});
 }
 function queueCloudSave(){
