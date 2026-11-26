@@ -89,7 +89,7 @@ const SUPABASE_URL="https://rbyfoimvxfqahuaxlbgj.supabase.co";
 const SUPABASE_PUBLISHABLE_KEY="sb_publishable_K96iEKofLWlbWNthgkC__Q_0pDHiGox";
 const supabaseClient=window.supabase.createClient(SUPABASE_URL,SUPABASE_PUBLISHABLE_KEY);
 let currentUser=null,storagePrefix="mdo3preview_guest_";
-const $=id=>document.getElementById(id),today=()=>{let d=new Date();return key(d)},key=d=>[d.getFullYear(),String(d.getMonth()+1).padStart(2,'0'),String(d.getDate()).padStart(2,'0')].join('-'),parse=s=>new Date(s+'T12:00:00'),load=(k,def)=>{try{return JSON.parse(localStorage.getItem(storagePrefix+k))??def}catch{return def}},save=()=>{localStorage.setItem(storagePrefix+'tasks',JSON.stringify(tasks));localStorage.setItem(storagePrefix+'habits',JSON.stringify(habits));localStorage.setItem(storagePrefix+'checks',JSON.stringify(checks));localStorage.setItem(storagePrefix+'goals',JSON.stringify(goals));queueCloudSave()};
+const $=id=>document.getElementById(id),today=()=>{let d=new Date();return key(d)},key=d=>[d.getFullYear(),String(d.getMonth()+1).padStart(2,'0'),String(d.getDate()).padStart(2,'0')].join('-'),parse=s=>new Date(s+'T12:00:00'),load=(k,def)=>{try{return JSON.parse(localStorage.getItem(storagePrefix+k))??def}catch{return def}},save=()=>{localStorage.setItem(storagePrefix+'tasks',JSON.stringify(tasks));localStorage.setItem(storagePrefix+'habits',JSON.stringify(habits));localStorage.setItem(storagePrefix+'checks',JSON.stringify(checks));localStorage.setItem(storagePrefix+'goals',JSON.stringify(goals));trackTaskChanges();queueCloudSave()};
 let tasks=[],habits=['Beber água','Fazer atividade física','Ler ou estudar','Organizar o ambiente'],checks={},goals=[],filter='all',selectedWeek=today(),reminderTimers=[];
 async function loadAccountData(){
  storagePrefix='mdo3preview_user_'+currentUser.id+'_';
@@ -100,27 +100,53 @@ async function loadAccountData(){
   localStorage.setItem('mdo3preview_account_migration_done','1');
  }
  tasks=load('tasks',[]);habits=load('habits',['Beber água','Fazer atividade física','Ler ou estudar','Organizar o ambiente']);checks=load('checks',{});goals=load('goals',[]);
+ taskTombstones=load('deletedTaskIds',{});
+ pendingTaskIds=new Set();
  filter='all';selectedWeek=today();render();setSyncLabel('Conectando à nuvem...');
  try{
-  const {data,error}=await supabaseClient.from('user_data').select('data,updated_at').eq('user_id',uid).maybeSingle();
-  if(error)throw error;
+  const [{data:legacy,error:legacyError},{data:rows,error:rowsError}]=await Promise.all([
+   supabaseClient.from('user_data').select('data,updated_at').eq('user_id',uid).maybeSingle(),
+   supabaseClient.from('user_tasks').select('task_id,task,deleted,updated_at').eq('user_id',uid)
+  ]);
+  if(legacyError)throw legacyError;if(rowsError)throw rowsError;
   if(currentUser?.id!==uid)return;
-  if(data&&data.data&&Object.keys(data.data).length){
-   lastCloudUpdatedAt=data.updated_at||null;
-   const cloudTasks=Array.isArray(data.data.tasks)?data.data.tasks:[];
-   const mergedTasks=mergeTasksById(tasks,cloudTasks);
-   const localHadExtra=mergedTasks.length!==cloudTasks.length;
-   tasks=mergedTasks;
-   habits=Array.isArray(data.data.habits)?data.data.habits:habits;
-   checks=data.data.checks&&typeof data.data.checks==='object'?data.data.checks:checks;
-   goals=Array.isArray(data.data.goals)?data.data.goals:goals;
-   saveLocalOnly();render();
-   if(localHadExtra){await writeCloudSnapshot(uid);setSyncLabel('Tarefas recuperadas e sincronizadas')}
-   else setSyncLabel('Sincronizado com a nuvem');
-  }else{
-   await writeCloudSnapshot(uid);
-   setSyncLabel('Dados enviados para a nuvem');
+  if(legacy?.data&&typeof legacy.data==='object'){
+   habits=Array.isArray(legacy.data.habits)?legacy.data.habits:habits;
+   checks=legacy.data.checks&&typeof legacy.data.checks==='object'?legacy.data.checks:checks;
+   goals=Array.isArray(legacy.data.goals)?legacy.data.goals:goals;
   }
+  const remoteRows=Array.isArray(rows)?rows:[];
+  if(remoteRows.length===0){
+   const oldTasks=Array.isArray(legacy?.data?.tasks)?legacy.data.tasks:[];
+   tasks=mergeTasksById(tasks,oldTasks);
+   const stamp=new Date().toISOString();
+   tasks=tasks.map(t=>({...t,_syncUpdatedAt:t._syncUpdatedAt||stamp}));
+   tasks.forEach(t=>pendingTaskIds.add(String(t.id)));
+   Object.keys(taskTombstones).forEach(id=>pendingTaskIds.add(id));
+  }else{
+   const localMap=new Map(tasks.filter(t=>t&&t.id!=null).map(t=>[String(t.id),t]));
+   const remoteIds=new Set();
+   for(const row of remoteRows){
+    const id=String(row.task_id);remoteIds.add(id);
+    const local=localMap.get(id),remoteStamp=Date.parse(row.updated_at||0),localStamp=Date.parse(local?._syncUpdatedAt||0);
+    if(row.deleted){
+     if(!local||remoteStamp>=localStamp){localMap.delete(id);taskTombstones[id]=row.updated_at||new Date().toISOString()}
+    }else if(!local||remoteStamp>localStamp){
+     localMap.set(id,{...row.task,_syncUpdatedAt:row.updated_at||new Date().toISOString()});
+     delete taskTombstones[id];
+    }else if(local){
+     pendingTaskIds.add(id);
+    }
+   }
+   tasks=Array.from(localMap.values());
+   for(const [id,task] of localMap){if(!remoteIds.has(id))pendingTaskIds.add(id)}
+   Object.keys(taskTombstones).forEach(id=>{if(!remoteIds.has(id))pendingTaskIds.add(id)});
+  }
+  taskBaseline=new Map(tasks.map(t=>[String(t.id),taskSignature(t)]));
+  saveLocalOnly();render();
+  await flushTaskChanges(uid);
+  await writeCloudSnapshot(uid);
+  setSyncLabel('Tarefas sincronizadas com a nuvem');
  }catch(err){console.error('Falha na sincronização inicial:',err);setSyncLabel('Falha na nuvem: dados locais preservados')}
 }
 
@@ -150,16 +176,83 @@ $('authForm').onsubmit=async e=>{e.preventDefault();const email=$('authEmail').v
 window.mdoLogout=()=>{const btn=$('logoutBtn');if(btn.disabled)return;btn.disabled=true;btn.textContent='Saindo...';showSignedOut();$('authMessage').textContent='Encerrando sua sessão...';supabaseClient.auth.signOut({scope:'local'}).then(({error})=>{if(error)throw error;$('authMessage').textContent='Você saiu da sua conta.'}).catch(err=>{console.error('Erro ao sair:',err);$('authMessage').textContent='A sessão local foi encerrada nesta tela. Se a conta voltar, atualize a página e tente novamente.'}).finally(()=>{btn.disabled=false;btn.textContent='Sair da conta'})};
 async function activateAccount(session){if(currentUser?.id===session.user.id&&window.accountLoaded)return;currentUser=session.user;window.accountLoaded=true;$('authGate').style.display='none';$('appRoot').style.display='block';document.querySelector('.tabs').style.display='flex';await loadAccountData();if(currentUser?.id!==session.user.id)return;startRealtimeSync(session.user.id);try{const {data}=await supabaseClient.from('profiles').select('id').eq('id',currentUser.id).maybeSingle();if(!data){const {error}=await supabaseClient.from('profiles').insert({id:currentUser.id,name:currentUser.user_metadata?.name||''});if(error)console.warn('Perfil não criado:',error.message)}}catch(err){console.warn('Perfil:',err.message)}}
 let cloudSaveTimer=null,cloudBusy=false,cloudPending=false,realtimeChannel=null,cloudRefreshBusy=false,cloudRefreshPending=false,lastCloudUpdatedAt=null;
+let taskBaseline=new Map(),pendingTaskIds=new Set(),taskTombstones={};
 function setSyncLabel(message){const el=$('syncStatus');if(el)el.textContent=message}
-function currentSnapshot(){return {tasks,habits,checks,goals}}
-function saveLocalOnly(){localStorage.setItem(storagePrefix+'tasks',JSON.stringify(tasks));localStorage.setItem(storagePrefix+'habits',JSON.stringify(habits));localStorage.setItem(storagePrefix+'checks',JSON.stringify(checks));localStorage.setItem(storagePrefix+'goals',JSON.stringify(goals))}
+function taskSignature(task){const copy={...task};delete copy._syncUpdatedAt;return JSON.stringify(copy)}
+function trackTaskChanges(){
+ if(!currentUser)return;
+ const now=new Date().toISOString(),current=new Map(tasks.filter(t=>t&&t.id!=null).map(t=>[String(t.id),t]));
+ for(const [id,task] of current){
+  const signature=taskSignature(task);
+  if(!taskBaseline.has(id)||taskBaseline.get(id)!==signature){
+   task._syncUpdatedAt=now;pendingTaskIds.add(id);delete taskTombstones[id];
+  }
+ }
+ for(const id of taskBaseline.keys()){
+  if(!current.has(id)){taskTombstones[id]=now;pendingTaskIds.add(id)}
+ }
+ taskBaseline=new Map(Array.from(current,([id,t])=>[id,taskSignature(t)]));
+ localStorage.setItem(storagePrefix+'deletedTaskIds',JSON.stringify(taskTombstones));
+}
+function currentSnapshot(){return {habits,checks,goals}}
+function saveLocalOnly(){localStorage.setItem(storagePrefix+'tasks',JSON.stringify(tasks));localStorage.setItem(storagePrefix+'habits',JSON.stringify(habits));localStorage.setItem(storagePrefix+'checks',JSON.stringify(checks));localStorage.setItem(storagePrefix+'goals',JSON.stringify(goals));localStorage.setItem(storagePrefix+'deletedTaskIds',JSON.stringify(taskTombstones))}
 async function writeCloudSnapshot(uid){const snapshot=currentSnapshot(),stamp=new Date().toISOString();const {error}=await supabaseClient.from('user_data').upsert({user_id:uid,data:snapshot,updated_at:stamp},{onConflict:'user_id'});if(error)throw error;lastCloudUpdatedAt=stamp}
 function mergeTasksById(localList,cloudList){const merged=new Map();(Array.isArray(cloudList)?cloudList:[]).forEach(t=>{if(t&&t.id!=null)merged.set(String(t.id),t)});(Array.isArray(localList)?localList:[]).forEach(t=>{if(t&&t.id!=null&&!merged.has(String(t.id)))merged.set(String(t.id),t)});return Array.from(merged.values())}
-function applyCloudData(data){if(!data||typeof data!=='object')return;const mergedTasks=mergeTasksById(tasks,data.tasks);const hasLocalOnlyTasks=mergedTasks.length>(Array.isArray(data.tasks)?data.tasks.length:0);tasks=mergedTasks;habits=Array.isArray(data.habits)?data.habits:habits;checks=data.checks&&typeof data.checks==='object'?data.checks:checks;goals=Array.isArray(data.goals)?data.goals:goals;saveLocalOnly();render();return hasLocalOnlyTasks}
-async function refreshCloudSnapshot(uid){if(!currentUser||currentUser.id!==uid)return;if(cloudRefreshBusy){cloudRefreshPending=true;return}if(cloudBusy||cloudSaveTimer){cloudRefreshPending=true;return}cloudRefreshBusy=true;try{const {data,error}=await supabaseClient.from('user_data').select('data,updated_at').eq('user_id',uid).maybeSingle();if(error)throw error;if(currentUser?.id!==uid)return;if(data?.data&&data.updated_at&&data.updated_at!==lastCloudUpdatedAt){const hasLocalOnlyTasks=applyCloudData(data.data);lastCloudUpdatedAt=data.updated_at;setSyncLabel('Atualizado de outro aparelho');if(hasLocalOnlyTasks){cloudPending=true;queueCloudSave()}}}catch(err){console.error('Falha ao receber atualização:',err);setSyncLabel('Não foi possível atualizar agora')}finally{cloudRefreshBusy=false;if(cloudRefreshPending){cloudRefreshPending=false;setTimeout(()=>refreshCloudSnapshot(uid),250)}}}
-function startRealtimeSync(uid){if(realtimeChannel)supabaseClient.removeChannel(realtimeChannel);realtimeChannel=supabaseClient.channel('mdo-user-data-'+uid).on('postgres_changes',{event:'*',schema:'public',table:'user_data',filter:'user_id=eq.'+uid},payload=>{if(payload.new?.updated_at&&payload.new.updated_at===lastCloudUpdatedAt)return;refreshCloudSnapshot(uid)}).subscribe(status=>{if(status==='SUBSCRIBED')setSyncLabel('Conectado: aguardando atualizações');else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT')setSyncLabel('Atualização em tempo real indisponível; dados locais preservados')})}
-function queueCloudSave(){if(!currentUser)return;clearTimeout(cloudSaveTimer);setSyncLabel('Salvando neste aparelho...');cloudSaveTimer=setTimeout(async()=>{cloudSaveTimer=null;if(cloudBusy){cloudPending=true;return}cloudBusy=true;const uid=currentUser?.id;try{if(uid){setSyncLabel('Sincronizando...');await writeCloudSnapshot(uid);if(currentUser?.id===uid)setSyncLabel('Sincronizado com a nuvem')}}catch(err){console.error('Falha ao salvar na nuvem:',err);setSyncLabel('Erro na nuvem: dados preservados neste aparelho')}finally{cloudBusy=false;if(cloudPending){cloudPending=false;queueCloudSave()}else if(cloudRefreshPending){cloudRefreshPending=false;setTimeout(()=>refreshCloudSnapshot(uid),250)}}},700)}
-function showSignedOut(){window.accountLoaded=false;currentUser=null;clearTimeout(cloudSaveTimer);cloudSaveTimer=null;if(realtimeChannel){supabaseClient.removeChannel(realtimeChannel);realtimeChannel=null}lastCloudUpdatedAt=null;$('appRoot').style.display='none';document.querySelector('.tabs').style.display='none';$('authGate').style.display='grid';setAuthMode('login')}
+async function flushTaskChanges(uid){
+ if(!pendingTaskIds.size)return;
+ const ids=Array.from(pendingTaskIds),rows=[];
+ for(const id of ids){
+  const tombstone=taskTombstones[id];
+  if(tombstone)rows.push({user_id:uid,task_id:id,task:{id},deleted:true,updated_at:tombstone});
+  else{const task=tasks.find(t=>String(t.id)===id);if(task)rows.push({user_id:uid,task_id:id,task,deleted:false,updated_at:task._syncUpdatedAt||new Date().toISOString()})}
+ }
+ if(!rows.length){pendingTaskIds.clear();return}
+ const {error}=await supabaseClient.from('user_tasks').upsert(rows,{onConflict:'user_id,task_id'});
+ if(error)throw error;
+ ids.forEach(id=>pendingTaskIds.delete(id));
+}
+async function refreshTaskRows(uid){
+ if(!currentUser||currentUser.id!==uid)return;
+ const {data,error}=await supabaseClient.from('user_tasks').select('task_id,task,deleted,updated_at').eq('user_id',uid);
+ if(error)throw error;
+ if(currentUser?.id!==uid)return;
+ const localMap=new Map(tasks.filter(t=>t&&t.id!=null).map(t=>[String(t.id),t]));
+ const remoteIds=new Set();
+ for(const row of data||[]){
+  const id=String(row.task_id);remoteIds.add(id);
+  const local=localMap.get(id),remoteStamp=Date.parse(row.updated_at||0),localStamp=Date.parse(local?._syncUpdatedAt||0);
+  if(row.deleted){
+   if(!local||remoteStamp>=localStamp){localMap.delete(id);taskTombstones[id]=row.updated_at||new Date().toISOString()}
+  }else if(!local||remoteStamp>localStamp){
+   localMap.set(id,{...row.task,_syncUpdatedAt:row.updated_at||new Date().toISOString()});delete taskTombstones[id];
+  }else if(local&&remoteStamp<localStamp){pendingTaskIds.add(id)}
+ }
+ tasks=Array.from(localMap.values());
+ for(const [id] of localMap)if(!remoteIds.has(id))pendingTaskIds.add(id);
+ Object.keys(taskTombstones).forEach(id=>{if(!remoteIds.has(id))pendingTaskIds.add(id)});
+ taskBaseline=new Map(tasks.map(t=>[String(t.id),taskSignature(t)]));
+ saveLocalOnly();render();
+ if(pendingTaskIds.size)queueCloudSave();
+}
+function applyCloudData(data){if(!data||typeof data!=='object')return;habits=Array.isArray(data.habits)?data.habits:habits;checks=data.checks&&typeof data.checks==='object'?data.checks:checks;goals=Array.isArray(data.goals)?data.goals:goals;localStorage.setItem(storagePrefix+'habits',JSON.stringify(habits));localStorage.setItem(storagePrefix+'checks',JSON.stringify(checks));localStorage.setItem(storagePrefix+'goals',JSON.stringify(goals));render()}
+async function refreshCloudSnapshot(uid){if(!currentUser||currentUser.id!==uid)return;if(cloudRefreshBusy){cloudRefreshPending=true;return}if(cloudBusy||cloudSaveTimer){cloudRefreshPending=true;return}cloudRefreshBusy=true;try{const {data,error}=await supabaseClient.from('user_data').select('data,updated_at').eq('user_id',uid).maybeSingle();if(error)throw error;if(currentUser?.id!==uid)return;if(data?.data&&data.updated_at&&data.updated_at!==lastCloudUpdatedAt){applyCloudData(data.data);lastCloudUpdatedAt=data.updated_at;setSyncLabel('Dados atualizados de outro aparelho')}}catch(err){console.error('Falha ao receber atualização:',err);setSyncLabel('Não foi possível atualizar agora')}finally{cloudRefreshBusy=false;if(cloudRefreshPending){cloudRefreshPending=false;setTimeout(()=>refreshCloudSnapshot(uid),250)}}}
+function startRealtimeSync(uid){
+ if(realtimeChannel)supabaseClient.removeChannel(realtimeChannel);
+ realtimeChannel=supabaseClient.channel('mdo-user-sync-'+uid)
+ .on('postgres_changes',{event:'*',schema:'public',table:'user_data',filter:'user_id=eq.'+uid},payload=>{if(payload.new?.updated_at&&payload.new.updated_at===lastCloudUpdatedAt)return;refreshCloudSnapshot(uid)})
+ .on('postgres_changes',{event:'*',schema:'public',table:'user_tasks',filter:'user_id=eq.'+uid},()=>{refreshTaskRows(uid).catch(err=>{console.error('Falha ao receber tarefas:',err);setSyncLabel('Erro ao atualizar tarefas; dados locais preservados')})})
+ .subscribe(status=>{if(status==='SUBSCRIBED')setSyncLabel('Conectado: sincronização ativa');else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT')setSyncLabel('Atualização em tempo real indisponível; dados locais preservados')});
+}
+function queueCloudSave(){
+ if(!currentUser)return;clearTimeout(cloudSaveTimer);setSyncLabel('Salvando neste aparelho...');
+ cloudSaveTimer=setTimeout(async()=>{
+  cloudSaveTimer=null;if(cloudBusy){cloudPending=true;return}cloudBusy=true;const uid=currentUser?.id;
+  try{if(uid){setSyncLabel('Sincronizando tarefas...');await flushTaskChanges(uid);await writeCloudSnapshot(uid);if(currentUser?.id===uid)setSyncLabel('Sincronizado com a nuvem')}}
+  catch(err){console.error('Falha ao salvar na nuvem:',err);setSyncLabel('Erro na nuvem: dados preservados neste aparelho')}
+  finally{cloudBusy=false;if(cloudPending){cloudPending=false;queueCloudSave()}else if(cloudRefreshPending){cloudRefreshPending=false;setTimeout(()=>refreshCloudSnapshot(uid),250)}}
+ },700)
+}
+function showSignedOut(){window.accountLoaded=false;currentUser=null;clearTimeout(cloudSaveTimer);cloudSaveTimer=null;if(realtimeChannel){supabaseClient.removeChannel(realtimeChannel);realtimeChannel=null}lastCloudUpdatedAt=null;taskBaseline=new Map();pendingTaskIds=new Set();taskTombstones={};$('appRoot').style.display='none';document.querySelector('.tabs').style.display='none';$('authGate').style.display='grid';setAuthMode('login')}
 supabaseClient.auth.onAuthStateChange((event,session)=>{if(session){setTimeout(()=>activateAccount(session),0)}else if(event==='SIGNED_OUT'||event==='INITIAL_SESSION')showSignedOut()});
 (async()=>{const {data,error}=await supabaseClient.auth.getSession();if(error){$('authMessage').textContent='Não foi possível verificar a sessão. Atualize a página.';return}if(data.session)await activateAccount(data.session);else showSignedOut()})();
 
