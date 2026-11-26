@@ -128,7 +128,8 @@ async function loadAccountData(){
    const remoteIds=new Set();
    for(const row of remoteRows){
     const id=String(row.task_id);remoteIds.add(id);
-    const local=localMap.get(id),remoteStamp=Date.parse(row.updated_at||0),localStamp=Date.parse(local?._syncUpdatedAt||0);
+    const local=localMap.get(id),remoteStamp=Date.parse(row.updated_at||0),localStamp=Date.parse(local?._syncUpdatedAt||0),localDeleteStamp=Date.parse(taskTombstones[id]||0);
+    if(taskTombstones[id]&&localDeleteStamp>=remoteStamp&&!row.deleted){pendingTaskIds.add(id);continue}
     if(row.deleted){
      if(!local||remoteStamp>=localStamp){localMap.delete(id);taskTombstones[id]=row.updated_at||new Date().toISOString()}
     }else if(!local||remoteStamp>localStamp){
@@ -220,7 +221,8 @@ async function refreshTaskRows(uid){
  const remoteIds=new Set();
  for(const row of data||[]){
   const id=String(row.task_id);remoteIds.add(id);
-  const local=localMap.get(id),remoteStamp=Date.parse(row.updated_at||0),localStamp=Date.parse(local?._syncUpdatedAt||0);
+  const local=localMap.get(id),remoteStamp=Date.parse(row.updated_at||0),localStamp=Date.parse(local?._syncUpdatedAt||0),localDeleteStamp=Date.parse(taskTombstones[id]||0);
+  if(taskTombstones[id]&&localDeleteStamp>=remoteStamp&&!row.deleted){pendingTaskIds.add(id);continue}
   if(row.deleted){
    if(!local||remoteStamp>=localStamp){localMap.delete(id);taskTombstones[id]=row.updated_at||new Date().toISOString()}
   }else if(!local||remoteStamp>localStamp){
